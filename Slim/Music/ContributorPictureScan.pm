@@ -18,11 +18,13 @@ L<Slim::Music::ContributorPictureScan>
 
 use strict;
 
-use File::Basename qw(dirname basename);
+use File::Basename qw(dirname fileparse);
 use File::Spec::Functions qw(catdir catfile);
+use List::Util qw(first);
 use Path::Class;
 
 use Slim::Music::Import;
+use Slim::Utils::Misc;
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
 use Slim::Utils::Scanner::Local;
@@ -30,7 +32,7 @@ use Slim::Utils::Scanner::Local;
 my $log = logger('scan.import');
 my $prefs = preferences('server');
 
-my ($dbh, $sth_album_folders, $sth_contributor_picture, $sth_update_contributor_picture, @artworkFolders, $specs, $i);
+my ($dbh, $sth_album_folders, $sth_contributor_picture, $sth_update_contributor_picture, $sth_portrait_by_name, $sth_portrait_by_folder, @artworkFolders, $specs, $i);
 
 # when walking up the folder hierarchy, don't go above these folders
 my $audioDirs = { map { $_ => 1 } @{Slim::Utils::Misc::getAudioDirs()} };
@@ -58,10 +60,51 @@ sub startArtworkScan {
 
 	main::INFOLOG && $log->info("Starting contributor portrait scan");
 
+	my $createTemporary = (main::DEBUGLOG && $log->is_debug) ? '' : 'TEMPORARY';
+	$createTemporary = '';
+
+	$dbh->do('DROP TABLE IF EXISTS pictures_found');
+	$dbh->do(qq{
+		CREATE $createTemporary TABLE pictures_found (
+			path TEXT PRIMARY KEY,
+			name TEXT
+		);
+		CREATE INDEX nameIndex ON pictures_found (name);
+	});
+
+	my $sth_picture = $dbh->prepare_cached(qq{
+		INSERT OR IGNORE
+		INTO pictures_found (path, name)
+		VALUES (?, ?)
+	});
+
+	my $suffixRegex = qr/\.(?:jpe?g|png|gif)$/i;
+	my $files = File::Next::files(  {
+		file_filter    => sub { Slim::Utils::Misc::fileFilter($File::Next::dir, $_, $suffixRegex) },
+		# descend_filter => sub { 0 },
+	}, @artworkFolders, Slim::Utils::Misc::getAudioDirs() );
+
+	while ( defined ( my $file = $files->() ) ) {
+		my ($name) = fileparse($file, $suffixRegex);
+		$sth_picture->execute($file, $name);
+	}
+
 	my $imageFolder = $prefs->get('artfolder');
 	if ( $imageFolder && -d $imageFolder ) {
 		$class->addArtworkFolder($imageFolder);
 	}
+
+	$sth_portrait_by_name = $dbh->prepare_cached(qq{
+		SELECT *
+		FROM pictures_found
+		WHERE name = ?
+	});
+
+	$sth_portrait_by_folder = $dbh->prepare_cached(qq{
+		SELECT *
+		FROM pictures_found
+		WHERE name IN ('artist', 'contributor') AND path LIKE ?
+	});
 
 	$sth_album_folders = $dbh->prepare_cached(qq{
 		SELECT url
@@ -122,6 +165,7 @@ sub _getArtistPhotoURL {
 		$artist->{name} = Slim::Utils::Unicode::utf8decode($artist->{name});
 
 		my $candidates = sanitizedNameVariants($artist->{name});
+		my $pictures;
 
 		$progress->update( $artist->{name} ) if $progress;
 		time() > $i && ($i = time + 5) && Slim::Schema->forceCommit;
@@ -129,9 +173,31 @@ sub _getArtistPhotoURL {
 		main::INFOLOG && $log->is_info && $log->info("Looking for pictures of  " . $artist->{name});
 
 		my $img;
-		foreach my $folder (@artworkFolders) {
-			$img = imageInFolder($folder, @$candidates);
-			last if $img;
+		NAME_LOOKUP: foreach my $candidate (@$candidates) {
+			$sth_portrait_by_name->execute($candidate);
+			$pictures = $sth_portrait_by_name->fetchall_arrayref();
+			if ($pictures && ref $pictures && scalar @$pictures) {
+				$pictures = [ map { $_->[0] } @$pictures ];
+
+				if (scalar @$pictures == 1) {
+					$img = $pictures->[0];
+					last NAME_LOOKUP;
+				}
+
+				foreach my $folder (@artworkFolders) {
+					if ($img = first { $_ =~ /^\Q$folder\E/ } @$pictures ) {
+						last NAME_LOOKUP;
+					}
+				}
+			}
+		}
+
+=pod
+		if (!$img) {
+			foreach my $folder (@artworkFolders) {
+				$img = imageInFolder($folder, @$candidates);
+				last if $img;
+			}
 		}
 
 		if (!$img) {
@@ -161,6 +227,7 @@ sub _getArtistPhotoURL {
 
 			$sth_album_folders->finish;
 		}
+=cut
 
 		if ($img) {
 			$img = Slim::Utils::Unicode::utf8encode($img);
