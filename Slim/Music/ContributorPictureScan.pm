@@ -32,8 +32,13 @@ my $prefs = preferences('server');
 
 my ($dbh, $sth_album_folders, $sth_contributor_picture, $sth_update_contributor_picture, @artworkFolders, $specs, $i);
 
+# tie my %candidates, 'Tie::Cache::LRU::Expires', EXPIRES => 300, ENTRIES => 1280;
+my %candidates;
+
 # when walking up the folder hierarchy, don't go above these folders
 my $audioDirs = { map { $_ => 1 } @{Slim::Utils::Misc::getAudioDirs()} };
+
+my %folders;
 
 sub init {
 	my $class = shift;
@@ -110,6 +115,15 @@ sub startArtworkScan {
 	main::INFOLOG && $log->info("Finished scan for contributor pictures.");
 
 	Slim::Music::Import->endImporter($class);
+
+	foreach (sort { $folders{$a} <=> $folders{$b} } keys %folders) {
+		print "$_: $folders{$_}\n";
+	}
+
+	my $total = 0;
+	foreach (values %folders) { $total += $_; }
+	warn $total;
+	warn scalar keys %candidates;
 }
 
 sub _getArtistPhotoURL {
@@ -157,6 +171,8 @@ sub _getArtistPhotoURL {
 						last ALBUMFOLDER if $img;
 					}
 				}
+
+				# %candidates = () if scalar keys %candidates > 1280;
 			}
 
 			$sth_album_folders->finish;
@@ -201,6 +217,8 @@ sub addArtworkFolder {
 		return;
 	}
 
+	main::INFOLOG && $log->is_info && $log->info("Adding '$folder' as contributor picture folder");
+
 	@artworkFolders = Slim::Utils::Misc::uniq(@artworkFolders, $folder);
 }
 
@@ -239,10 +257,22 @@ sub imageInFolder {
 		foreach my $ext ('jpg', 'JPG', 'jpeg', 'JPEG', 'png', 'PNG', 'gif', 'GIF') {
 			my $candidate = catdir($folder, $name . ".$ext");
 
+			# shortcut for items we've checked before
+			# if (defined $candidates{$candidate}) {
+			# 	$file = $candidates{$candidate} || undef;
+			# 	last LOOKUP;
+			# }
+
+	# $folders{$candidate}++;
+
 			if (-f $candidate) {
 				$file = $candidate;
+				# $candidates{$candidate} = $candidate if $name eq 'artist' || $name eq 'contributor';
 				last LOOKUP;
 			}
+
+			# item was not found - cache falsy, but defined value
+			# $candidates{$candidate} = 0 if $name eq 'artist' || $name eq 'contributor';
 		}
 	}
 
